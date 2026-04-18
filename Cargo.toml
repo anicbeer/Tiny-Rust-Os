@@ -1,0 +1,20 @@
+[package]
+name = "rvos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spin = "0.9"
+bitflags = "2.4"
+virtio-drivers = "0.7"
+smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "log"] }
+xmas-elf = "0.9"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+log = "0.4"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = true
