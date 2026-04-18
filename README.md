@@ -213,7 +213,7 @@ This is an educational operating system. Use it however you like.
 ---
 
 # RVOS — 用 Rust 编写的 RISC-V 操作系统（中文版）
-
+ 
 一个极简的 RISC-V 64 位操作系统内核，使用 Rust 编写（`#![no_std]`）。它能够在 QEMU 中通过 virtio-net 网络运行未经修改的静态链接 Linux nginx 二进制程序。
 
 ## 功能特性
