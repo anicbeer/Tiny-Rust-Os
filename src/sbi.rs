@@ -2,7 +2,7 @@
 
 const SBI_SET_TIMER: usize = 0;
 const SBI_CONSOLE_PUTCHAR: usize = 1;
-const SBI_SHUTDOWN: usize = 8;
+const SBI_SRST: usize = 0x53525354;
 
 fn sbi_call(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
     let mut ret;
@@ -24,6 +24,7 @@ pub fn set_timer(timer: usize) {
 }
 
 pub fn shutdown() -> ! {
-    sbi_call(SBI_SHUTDOWN, 0, 0, 0, 0);
+    // System Reset Extension: type=0 (shutdown), reason=0 (no reason)
+    sbi_call(SBI_SRST, 0, 0, 0, 0);
     loop {}
 }

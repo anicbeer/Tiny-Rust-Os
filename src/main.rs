@@ -44,9 +44,9 @@ extern "C" fn rust_main(hartid: usize, dtb: usize) -> ! {
 
     info!("Kernel init complete.");
 
-    // Load and run nginx
-    let nginx_data = fs::get_file_data("/sbin/nginx").expect("nginx binary not found");
-    proc::init_user_proc(nginx_data).expect("failed to load nginx");
+    // Load and run busybox shell
+    let sh_data = fs::get_file_data("/bin/sh").expect("sh binary not found");
+    proc::init_user_proc(sh_data, &["sh", "-c", "echo '=== RVOS Shell ==='; ls /; cat /etc/passwd; echo '=== Done ==='"]).expect("failed to load shell");
     proc::run_user();
 }
 

@@ -1,7 +1,10 @@
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::vec::Vec;
 
 pub static LAST_TP: AtomicUsize = AtomicUsize::new(0);
+use spin::Mutex;
+pub static CURRENT_TRAP_FRAME: Mutex<TrapFrame> = Mutex::new(TrapFrame::new());
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -89,7 +92,12 @@ unsafe extern "C" fn trap_vector() {
         "csrs sstatus, t0",    // allow S-mode to access U-mode pages
         "mv a0, sp",
         "call rust_trap_handler",
-        // Restore
+        // After rust_trap_handler, call do_schedule which may switch processes.
+        // do_schedule takes tf_sp in a0 and returns new tf_sp in a0.
+        "mv a0, sp",
+        "call do_schedule",
+        "mv sp, a0",
+        // Restore from (possibly new) kernel stack
         "ld x0, 0(sp)",   // no-op but keeps offsets
         "ld x1, 8(sp)",
         "ld x3, 24(sp)",
@@ -157,9 +165,17 @@ extern "C" fn rust_trap_handler(tf: &mut TrapFrameRaw) {
 
     log::info!("TRAP cause={} sepc={:#x} stval={:#x} from_user={}", cause, sepc, stval, from_user);
 
+    // Save current trap frame for syscalls that need it (clone, etc.)
+    {
+        let mut ctf = CURRENT_TRAP_FRAME.lock();
+        ctf.regs = tf.x;
+        ctf.regs[2] = tf.orig_sp; // x2 saved in trap_vector is kernel sp
+        ctf.sepc = tf.sepc;
+        ctf.sstatus = tf.sstatus;
+    }
+
     match cause {
         8 | 9 | 10 => { // ecall from U/S/M
-            tf.sepc += 4; // advance past ecall instruction
             let num = tf.x[17]; // a7
             let args = [tf.x[10], tf.x[11], tf.x[12], tf.x[13], tf.x[14], tf.x[15]];
             if num == 57 {
@@ -168,7 +184,21 @@ extern "C" fn rust_trap_handler(tf: &mut TrapFrameRaw) {
             } else {
                 log::debug!("SYSCALL {} args={:x?} sepc={:#x}", num, args, sepc);
             }
+            let is_execve = num == 221;
+            if !is_execve {
+                tf.sepc += 4; // advance past ecall instruction
+            }
             let ret = crate::syscall::dispatch(num, args);
+            if is_execve && ret == 0 {
+                // execve succeeded: sync updated trap frame back to stack
+                let ctf = CURRENT_TRAP_FRAME.lock();
+                log::info!("EXECVE sync: old_sepc={:#x} new_sepc={:#x}", tf.sepc, ctf.sepc);
+                tf.sepc = ctf.sepc;
+                tf.orig_sp = ctf.regs[2];
+                tf.x[10] = ctf.regs[10];
+            } else if is_execve && ret < 0 {
+                tf.sepc += 4; // execve failed, continue after ecall
+            }
             if num == 57 {
                 log::info!("SYSCALL {} return {}", num, ret);
             } else {
@@ -183,13 +213,110 @@ extern "C" fn rust_trap_handler(tf: &mut TrapFrameRaw) {
             let mut dump = alloc::string::String::new();
             for i in 0..8 {
                 let addr = tf.orig_sp + i * 8;
-                let val = if let Some(proc) = crate::proc::CURRENT_PROC.lock().as_ref() {
-                    proc.page_table.translate(addr).map(|pa| unsafe { *(pa as *const usize) }).unwrap_or(0)
-                } else { 0 };
+                let val = {
+                    let pid = *crate::proc::CURRENT_PID.lock();
+                    let table = crate::proc::PROC_TABLE.lock();
+                    if let Some(proc) = table.get(&pid) {
+                        proc.page_table.translate(addr).map(|pa| unsafe { *(pa as *const usize) }).unwrap_or(0)
+                    } else { 0 }
+                };
                 dump.push_str(&alloc::format!(" {:#x}={:#x}", addr, val));
             }
             log::warn!(" stack:{}" , dump);
             loop {}
         }
     }
+}
+
+/// Save current trap frame, pick next Ready process, copy its trap frame to its kernel stack,
+/// switch page table, and return the new kernel stack pointer (tf base).
+#[no_mangle]
+unsafe extern "C" fn do_schedule(tf_sp: usize) -> usize {
+    use crate::proc::{ProcState, PROC_TABLE, CURRENT_PID};
+
+    // 1. Save current trap frame from stack to process struct
+    let raw = &*(tf_sp as *const TrapFrameRaw);
+    let current_pid = *CURRENT_PID.lock();
+    {
+        let mut table = PROC_TABLE.lock();
+        if let Some(proc) = table.get_mut(&current_pid) {
+            if proc.state == ProcState::Running {
+                proc.state = ProcState::Ready;
+            }
+            proc.trap_frame.regs = raw.x;
+            proc.trap_frame.regs[2] = raw.orig_sp; // x2 saved in trap_vector is kernel sp
+            proc.trap_frame.sepc = raw.sepc;
+            proc.trap_frame.sstatus = raw.sstatus;
+            log::info!("SCHED save pid={} sepc={:#x}", current_pid, raw.sepc);
+        }
+    }
+
+    // 2. Find next Ready process (round-robin)
+    let next_pid = {
+        let table = PROC_TABLE.lock();
+        let pids: Vec<usize> = table.iter()
+            .filter(|(_, p)| p.state == ProcState::Ready)
+            .map(|(pid, _)| *pid)
+            .collect();
+        if pids.is_empty() {
+            // No other ready process; check if current is zombie
+            drop(table);
+            let mut table = PROC_TABLE.lock();
+            if let Some(proc) = table.get_mut(&current_pid) {
+                if proc.state == ProcState::Zombie {
+                    log::info!("No runnable processes left, shutting down.");
+                    // Switch to kernel page table so 0x100000 is mapped for sifive_test finisher
+                    let ksatp = {
+                        let kpt = crate::mm::KERNEL_PAGE_TABLE.lock();
+                        let ppn = kpt.as_ref().expect("kernel page table missing").root_ppn();
+                        (8usize << 60) | ppn
+                    };
+                    unsafe {
+                        core::arch::asm!("csrw satp, {}", in(reg) ksatp);
+                        core::arch::asm!("sfence.vma");
+                        core::ptr::write_volatile(0x100000 as *mut u32, 0x5555);
+                    }
+                    crate::sbi::shutdown();
+                }
+                proc.state = ProcState::Running;
+            }
+            return tf_sp;
+        }
+        // Simple round-robin: pick first ready after current, or first
+        let pos = pids.iter().position(|&p| p > current_pid).unwrap_or(0);
+        pids[pos]
+    };
+
+    if next_pid == current_pid {
+        return tf_sp;
+    }
+
+    // 3. Switch to next process
+    let new_sp = {
+        let mut table = PROC_TABLE.lock();
+        let next_proc = table.get_mut(&next_pid).expect("next proc missing");
+        next_proc.state = ProcState::Running;
+        *CURRENT_PID.lock() = next_pid;
+
+        // Switch SATP
+        let satp = (8usize << 60) | next_proc.page_table.root_ppn();
+        asm!("csrw satp, {}", in(reg) satp);
+        asm!("sfence.vma");
+
+        // Copy trap frame to new kernel stack
+        let new_tf_sp = next_proc.kernel_stack - 288;
+        let dst = new_tf_sp as *mut TrapFrameRaw;
+        log::info!("SCHED restore pid={} sepc={:#x}", next_pid, next_proc.trap_frame.sepc);
+        *dst = TrapFrameRaw {
+            x: next_proc.trap_frame.regs,
+            orig_sp: next_proc.trap_frame.regs[2],
+            sepc: next_proc.trap_frame.sepc,
+            sstatus: next_proc.trap_frame.sstatus,
+        };
+
+        new_tf_sp
+    };
+
+    log::info!("SCHED: {} -> {}", current_pid, next_pid);
+    new_sp
 }

@@ -26,6 +26,45 @@ enum FakeFdType {
 static FAKE_FDS: Mutex<BTreeMap<usize, FakeFdType>> = Mutex::new(BTreeMap::new());
 static FAKE_FD_NEXT: Mutex<usize> = Mutex::new(100);
 
+struct PipeInner {
+    buf: alloc::vec::Vec<u8>,
+    head: usize,
+    tail: usize,
+    write_closed: bool,
+    read_closed: bool,
+}
+
+impl PipeInner {
+    fn new() -> Self {
+        Self { buf: alloc::vec![0u8; 4096], head: 0, tail: 0, write_closed: false, read_closed: false }
+    }
+    fn write(&mut self, data: &[u8]) -> usize {
+        if self.read_closed { return 0; }
+        let mut written = 0;
+        for &b in data {
+            let next = (self.tail + 1) % self.buf.len();
+            if next == self.head { break; } // full
+            self.buf[self.tail] = b;
+            self.tail = next;
+            written += 1;
+        }
+        written
+    }
+    fn read(&mut self, out: &mut [u8]) -> usize {
+        let mut n = 0;
+        while n < out.len() && self.head != self.tail {
+            out[n] = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len();
+            n += 1;
+        }
+        n
+    }
+}
+
+static PIPES: Mutex<BTreeMap<usize, spin::Mutex<PipeInner>>> = Mutex::new(BTreeMap::new());
+static NEXT_PIPE_ID: Mutex<usize> = Mutex::new(1);
+
+#[derive(Clone)]
 pub struct FdTable {
     files: Vec<Option<OpenFile>>,
 }
@@ -33,9 +72,9 @@ pub struct FdTable {
 impl FdTable {
     pub fn new() -> Self {
         let mut files = Vec::with_capacity(64);
-        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true })); // stdin
-        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true })); // stdout
-        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true })); // stderr
+        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true, pipe_id: None })); // stdin
+        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true, pipe_id: None })); // stdout
+        files.push(Some(OpenFile { inode: 0, offset: 0, readable: true, writable: true, pipe_id: None })); // stderr
         Self { files }
     }
     pub fn alloc(&mut self, file: OpenFile) -> usize {
@@ -89,8 +128,10 @@ pub fn dispatch(num: usize, args: [usize; 6]) -> isize {
         54 => sys_fchownat(args[0] as isize, args[1] as *const u8, args[2] as isize, args[3] as isize, args[4]),
         56 => sys_openat(args[0] as isize, args[1] as *const u8, args[2] as isize, args[3] as isize),
         57 => sys_close(args[0] as isize),
+        59 => sys_pipe2(args[0] as *mut i32, args[1] as isize),
         61 => sys_getdents64(args[0] as isize, args[1] as *mut u8, args[2]),
         62 => sys_lseek(args[0] as isize, args[1] as isize, args[2] as isize),
+        71 => sys_sendfile(args[0] as isize, args[1] as isize, args[2] as *mut isize, args[3]),
         63 => sys_read(args[0] as isize, args[1] as *mut u8, args[2]),
         64 => sys_write(args[0] as isize, args[1] as *const u8, args[2]),
         66 => sys_writev(args[0] as isize, args[1] as *const u8, args[2]),
@@ -109,6 +150,9 @@ pub fn dispatch(num: usize, args: [usize; 6]) -> isize {
         123 => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
         134 => sys_rt_sigaction(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         135 => sys_rt_sigprocmask(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
+        144 => sys_setgid(args[0] as isize),
+        146 => sys_setuid(args[0] as isize),
+        159 => sys_setgroups(args[0] as isize, args[1] as *const u8),
         160 => sys_uname(args[0] as *mut u8),
         163 => sys_getrlimit(args[0] as isize, args[1] as *mut u8),
         166 => sys_umask(args[0] as isize),
@@ -137,6 +181,7 @@ pub fn dispatch(num: usize, args: [usize; 6]) -> isize {
         214 => sys_brk(args[0]),
         215 => sys_munmap(args[0], args[1]),
         220 => sys_clone(args[0], args[1], args[2] as *mut isize, args[3] as *mut isize, args[4]),
+        221 => sys_execve(args[0] as *const u8, args[1] as *const *const u8, args[2] as *const *const u8),
         222 => sys_mmap(args[0], args[1], args[2] as isize, args[3] as isize, args[4] as isize, args[5] as i64),
         226 => sys_mprotect(args[0], args[1], args[2] as isize),
         233 => sys_madvise(args[0], args[1], args[2] as isize),
@@ -177,6 +222,18 @@ fn sys_write(fd: isize, buf: *const u8, count: usize) -> isize {
     }
     let mut fd_table = FD_TABLE.lock();
     if let Some(of) = fd_table.get(fd as usize) {
+        if let Some(pid) = of.pipe_id {
+            drop(fd_table);
+            let pipes = PIPES.lock();
+            if let Some(pipe) = pipes.get(&pid) {
+                let mut inner = pipe.lock();
+                let mut tmp = alloc::vec![0u8; count];
+                unsafe { core::ptr::copy_nonoverlapping(buf, tmp.as_mut_ptr(), count); }
+                let n = inner.write(&tmp);
+                return n as isize;
+            }
+            return 0;
+        }
         let mut tmp = alloc::vec![0u8; count];
         unsafe { core::ptr::copy_nonoverlapping(buf, tmp.as_mut_ptr(), count); }
         let n = fs::write_inode(of.inode, &tmp, of.offset);
@@ -205,6 +262,20 @@ fn sys_read(fd: isize, buf: *mut u8, count: usize) -> isize {
     }
     let mut fd_table = FD_TABLE.lock();
     if let Some(of) = fd_table.get(fd as usize) {
+        if let Some(pid) = of.pipe_id {
+            drop(fd_table);
+            let pipes = PIPES.lock();
+            if let Some(pipe) = pipes.get(&pid) {
+                let mut inner = pipe.lock();
+                let mut tmp = alloc::vec![0u8; count];
+                let n = inner.read(&mut tmp);
+                if n > 0 {
+                    unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf, n); }
+                }
+                return n as isize;
+            }
+            return 0;
+        }
         let mut tmp = alloc::vec![0u8; count];
         let n = fs::read_inode(of.inode, &mut tmp, of.offset);
         unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf, n); }
@@ -240,18 +311,35 @@ fn sys_openat(_dirfd: isize, path: *const u8, flags: isize, _mode: isize) -> isi
         let readable = true;
         let writable = (flags & 0o1) != 0 || (flags & 0o2) != 0; // O_WRONLY or O_RDWR
         let mut fd_table = FD_TABLE.lock();
-        let fd = fd_table.alloc(OpenFile { inode, offset: 0, readable, writable });
+        let fd = fd_table.alloc(OpenFile { inode, offset: 0, readable, writable, pipe_id: None });
         return fd as isize;
     }
     -1
 }
 
 fn read_user_u64(addr: usize) -> Option<usize> {
-    if let Some(proc) = crate::proc::CURRENT_PROC.lock().as_ref() {
+    crate::proc::with_current_proc_ref(|proc| {
         proc.page_table.translate(addr).map(|pa| unsafe { *(pa as *const usize) })
-    } else {
-        None
+    }).flatten()
+}
+
+fn read_user_byte(addr: usize) -> Option<u8> {
+    crate::proc::with_current_proc_ref(|proc| {
+        proc.page_table.translate(addr).map(|pa| unsafe { *(pa as *const u8) })
+    }).flatten()
+}
+
+fn read_user_str(addr: usize) -> Option<alloc::string::String> {
+    let mut s = alloc::string::String::new();
+    let mut off = 0usize;
+    loop {
+        let b = read_user_byte(addr + off)?;
+        if b == 0 { break; }
+        s.push(b as char);
+        off += 1;
+        if off > 4096 { return None; }
     }
+    Some(s)
 }
 
 fn sys_close(fd: isize) -> isize {
@@ -304,17 +392,12 @@ fn sys_fstatat(_dirfd: isize, path: *const u8, buf: *mut u8, _flags: isize) -> i
 
 fn sys_exit(code: isize) -> isize {
     log::info!("exit({})", code);
-    unsafe {
-        let main_arena = 0x10eb18 as *const usize;
-        log::info!("main_arena at exit: {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}",
-            *main_arena, *main_arena.add(1), *main_arena.add(2), *main_arena.add(3),
-            *main_arena.add(4), *main_arena.add(5), *main_arena.add(6), *main_arena.add(7));
-    }
-    loop {}
+    crate::proc::exit_process(code);
+    0
 }
 
 fn sys_brk(addr: usize) -> isize {
-    if let Some(proc) = crate::proc::CURRENT_PROC.lock().as_mut() {
+    crate::proc::with_current_proc(|proc| {
         if proc.brk == 0 {
             proc.brk = 0x10000;
         }
@@ -334,9 +417,8 @@ fn sys_brk(addr: usize) -> isize {
         }
         proc.brk = addr;
         log::info!("sys_brk: addr={:#x} -> brk={:#x}", addr, proc.brk);
-        return addr as isize;
-    }
-    -1
+        addr as isize
+    }).unwrap_or(-1)
 }
 
 fn sys_mmap(addr: usize, len: usize, prot: isize, flags: isize, fd: isize, offset: i64) -> isize {
@@ -356,7 +438,7 @@ fn sys_mmap(addr: usize, len: usize, prot: isize, flags: isize, fd: isize, offse
         ret
     };
 
-    if let Some(proc) = crate::proc::CURRENT_PROC.lock().as_mut() {
+    crate::proc::with_current_proc(|proc| {
         for page in (0..aligned_len).step_by(0x1000) {
             let va = ret + page;
             if proc.page_table.translate(va).is_none() {
@@ -369,7 +451,7 @@ fn sys_mmap(addr: usize, len: usize, prot: isize, flags: isize, fd: isize, offse
                 }
             }
         }
-    }
+    });
 
     // Zero-initialize mapped pages (important for anonymous mmap)
     unsafe { core::ptr::write_bytes(ret as *mut u8, 0, aligned_len); }
@@ -395,8 +477,15 @@ fn sys_munmap(_addr: usize, _len: usize) -> isize { 0 }
 fn sys_mprotect(_addr: usize, _len: usize, _prot: isize) -> isize { 0 }
 fn sys_madvise(_addr: usize, _len: usize, _advice: isize) -> isize { 0 }
 
-fn sys_getpid() -> isize { 1 }
-fn sys_getppid() -> isize { 0 }
+fn sys_getpid() -> isize { *crate::proc::CURRENT_PID.lock() as isize }
+fn sys_getppid() -> isize {
+    let pid = *crate::proc::CURRENT_PID.lock();
+    let table = crate::proc::PROC_TABLE.lock();
+    table.get(&pid).map(|p| p.ppid as isize).unwrap_or(0)
+}
+fn sys_setgid(_gid: isize) -> isize { 0 }
+fn sys_setuid(_uid: isize) -> isize { 0 }
+fn sys_setgroups(_size: isize, _list: *const u8) -> isize { 0 }
 fn sys_getuid() -> isize { 0 }
 fn sys_geteuid() -> isize { 0 }
 fn sys_getgid() -> isize { 0 }
@@ -548,7 +637,7 @@ fn sys_epoll_create1(_flags: isize) -> isize {
     FAKE_FDS.lock().insert(fd, FakeFdType::Epoll);
     fd as isize
 }
-fn sys_epoll_ctl(_epfd: isize, op: isize, fd: isize, event: *mut u8) -> isize {
+fn sys_epoll_ctl(_epfd: isize, _op: isize, fd: isize, event: *mut u8) -> isize {
     if (is_inet_socket(fd as usize) || is_fake_fd(fd as usize)) && !event.is_null() {
         unsafe {
             // struct epoll_event on riscv64 Linux: u32 events; u32 padding; u64 data;
@@ -588,7 +677,44 @@ fn sys_epoll_pwait(_epfd: isize, events: *mut u8, maxevents: usize, timeout: isi
     }
 }
 
-fn sys_getdents64(_fd: isize, _buf: *mut u8, _count: usize) -> isize { -1 }
+fn sys_pipe2(pipefd: *mut i32, _flags: isize) -> isize {
+    let mut pipes = PIPES.lock();
+    let mut next_id = NEXT_PIPE_ID.lock();
+    let id = *next_id;
+    *next_id += 1;
+    pipes.insert(id, spin::Mutex::new(PipeInner::new()));
+    drop(pipes);
+
+    let mut fd_table = FD_TABLE.lock();
+    let rfd = fd_table.alloc(OpenFile { inode: 0, offset: 0, readable: true, writable: false, pipe_id: Some(id) });
+    let wfd = fd_table.alloc(OpenFile { inode: 0, offset: 0, readable: false, writable: true, pipe_id: Some(id) });
+    unsafe {
+        *pipefd = rfd as i32;
+        *pipefd.add(1) = wfd as i32;
+    }
+    0
+}
+
+fn sys_sendfile(out_fd: isize, in_fd: isize, _offset: *mut isize, count: usize) -> isize {
+    let mut buf = alloc::vec![0u8; count.min(4096)];
+    let n = sys_read(in_fd, buf.as_mut_ptr(), buf.len());
+    if n <= 0 { return n; }
+    sys_write(out_fd, buf.as_ptr(), n as usize)
+}
+
+fn sys_getdents64(fd: isize, buf: *mut u8, count: usize) -> isize {
+    let mut fd_table = FD_TABLE.lock();
+    if let Some(of) = fd_table.get(fd as usize) {
+        let mut tmp = alloc::vec![0u8; count];
+        let (n, next_off) = fs::read_dir(of.inode, &mut tmp, of.offset);
+        if n > 0 {
+            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf, n); }
+            of.offset = next_off;
+        }
+        return n as isize;
+    }
+    -1
+}
 fn sys_pread64(fd: isize, buf: *mut u8, count: usize, offset: i64) -> isize {
     let mut fd_table = FD_TABLE.lock();
     if let Some(of) = fd_table.get(fd as usize) {
@@ -610,11 +736,135 @@ fn sys_pwrite64(fd: isize, buf: *const u8, count: usize, offset: i64) -> isize {
     -1
 }
 
-fn sys_clone(_flags: usize, _stack: usize, _ptid: *mut isize, _ctid: *mut isize, _tls: usize) -> isize {
-    log::warn!("clone stubbed");
-    -1
+fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> isize {
+    let path = match read_user_str(path as usize) {
+        Some(s) => s,
+        None => return -1,
+    };
+    log::info!("sys_execve: path={}", path);
+
+    // Read argv array
+    let mut argv_strs = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    loop {
+        match read_user_u64((argv as usize) + i * 8) {
+            Some(0) | None => break,
+            Some(ptr) => {
+                if let Some(s) = read_user_str(ptr) {
+                    argv_strs.push(s);
+                } else {
+                    break;
+                }
+            }
+        }
+        i += 1;
+        if i > 128 { break; }
+    }
+
+    // Read envp array
+    let mut envp_strs = alloc::vec::Vec::new();
+    i = 0;
+    loop {
+        match read_user_u64((envp as usize) + i * 8) {
+            Some(0) | None => break,
+            Some(ptr) => {
+                if let Some(s) = read_user_str(ptr) {
+                    envp_strs.push(s);
+                } else {
+                    break;
+                }
+            }
+        }
+        i += 1;
+        if i > 128 { break; }
+    }
+
+    let data = match fs::get_file_data(&path) {
+        Some(d) => d,
+        None => {
+            log::warn!("sys_execve: file not found: {}", path);
+            return -1;
+        }
+    };
+
+    // Ensure PATH is set
+    if !envp_strs.iter().any(|s| s.starts_with("PATH=")) {
+        envp_strs.push(alloc::string::String::from("PATH=/bin"));
+    }
+    log::info!("sys_execve: argv={:?} envp={:?}", argv_strs, envp_strs);
+
+    let result: Option<usize> = crate::proc::with_current_proc(|proc| {
+        crate::proc::exec_process(proc, data, &argv_strs, &envp_strs)
+    }).flatten();
+
+    if let Some(sp) = result {
+        let sepc = crate::proc::with_current_proc_ref(|p| p.trap_frame.sepc).unwrap_or(0);
+        let mut tf = crate::trap::CURRENT_TRAP_FRAME.lock();
+        tf.sepc = sepc;
+        tf.regs[2] = sp;
+        tf.regs[10] = argv_strs.len();
+        // Switch to new page table immediately so the next sret uses it
+        let satp = crate::proc::with_current_proc_ref(|p| {
+            (8usize << 60) | p.page_table.root_ppn()
+        }).unwrap_or(0);
+        unsafe {
+            core::arch::asm!("csrw satp, {}", in(reg) satp);
+            core::arch::asm!("sfence.vma");
+        }
+        0
+    } else {
+        -1
+    }
 }
-fn sys_wait4(_pid: isize, _wstatus: *mut isize, _options: isize, _rusage: *mut u8) -> isize { -1 }
+
+fn sys_clone(_flags: usize, stack: usize, _ptid: *mut isize, _ctid: *mut isize, _tls: usize) -> isize {
+    let tf = crate::trap::CURRENT_TRAP_FRAME.lock().clone();
+    if let Some(child_pid) = crate::proc::fork_process(&tf) {
+        // If child stack is specified, update child's sp
+        if stack != 0 {
+            let mut table = crate::proc::PROC_TABLE.lock();
+            if let Some(child) = table.get_mut(&child_pid) {
+                child.trap_frame.regs[2] = stack;
+            }
+        }
+        log::info!("sys_clone: flags={:#x} stack={:#x} -> child_pid={}", _flags, stack, child_pid);
+        child_pid as isize
+    } else {
+        -1
+    }
+}
+
+fn sys_wait4(pid: isize, wstatus: *mut isize, _options: isize, _rusage: *mut u8) -> isize {
+    let current_pid = *crate::proc::CURRENT_PID.lock();
+    let table = crate::proc::PROC_TABLE.lock();
+    let mut zombie_pid = None;
+    for (cpid, proc) in table.iter() {
+        if proc.ppid == current_pid && proc.state == crate::proc::ProcState::Zombie {
+            if pid > 0 && *cpid != pid as usize {
+                continue;
+            }
+            zombie_pid = Some((*cpid, proc.exit_code));
+            break;
+        }
+    }
+    if let Some((zpid, code)) = zombie_pid {
+        drop(table);
+        if !wstatus.is_null() {
+            unsafe { *wstatus = ((code & 0xff) << 8) as isize; }
+        }
+        // Remove zombie from table
+        crate::proc::PROC_TABLE.lock().remove(&zpid);
+        log::info!("sys_wait4: pid={} -> zombie {} exited with code {}", pid, zpid, code);
+        zpid as isize
+    } else {
+        // No matching zombie child; for non-blocking (WNOHANG=1) return 0, else return -EAGAIN
+        if _options & 1 != 0 {
+            0
+        } else {
+            -11 // EAGAIN
+        }
+    }
+}
 fn sys_sched_setaffinity(_pid: isize, _len: usize, _mask: *const u8) -> isize { 0 }
 fn sys_sched_getaffinity(_pid: isize, _len: usize, _mask: *mut u8) -> isize { 0 }
 fn sys_statx(_dirfd: isize, path: *const u8, _flags: isize, _mask: u32, buf: *mut u8) -> isize {

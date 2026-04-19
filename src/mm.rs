@@ -242,6 +242,59 @@ impl PageTable {
             ppn = pte.ppn();
         }
     }
+
+    /// Clone the page table, copying all user pages (pages with U flag) to new physical pages.
+    /// Kernel identity mappings are recreated without copying.
+    pub fn clone_user_space(&self) -> Option<Self> {
+        let mut new_pt = PageTable::new()?;
+        // Identity-map kernel and device regions
+        for addr in (0x8000_0000..0x8800_0000).step_by(PAGE_SIZE) {
+            new_pt.map(addr, addr, PTEFlags::R | PTEFlags::W | PTEFlags::X);
+        }
+        new_pt.map(0x1000_0000, 0x1000_0000, PTEFlags::R | PTEFlags::W);
+        for addr in (0x1000_1000..0x1000_9000).step_by(PAGE_SIZE) {
+            new_pt.map(addr, addr, PTEFlags::R | PTEFlags::W);
+        }
+        for addr in (0x0c00_0000..0x0c20_0000).step_by(PAGE_SIZE) {
+            new_pt.map(addr, addr, PTEFlags::R | PTEFlags::W);
+        }
+
+        // Walk the page table and copy user pages
+        let root = self.root_ppn << PAGE_SIZE_BITS;
+        for i in 0..512 {
+            let pte0 = unsafe { &*(root as *const PageTableEntry).add(i) };
+            if !pte0.is_valid() { continue; }
+            let ppn0 = pte0.ppn();
+            let addr0 = ppn0 << PAGE_SIZE_BITS;
+            for j in 0..512 {
+                let pte1 = unsafe { &*(addr0 as *const PageTableEntry).add(j) };
+                if !pte1.is_valid() { continue; }
+                let ppn1 = pte1.ppn();
+                let addr1 = ppn1 << PAGE_SIZE_BITS;
+                for k in 0..512 {
+                    let pte2 = unsafe { &*(addr1 as *const PageTableEntry).add(k) };
+                    if !pte2.is_valid() { continue; }
+                    let flags = pte2.flags();
+                    if !flags.contains(PTEFlags::U) { continue; }
+
+                    let vpn = (i << 18) | (j << 9) | k;
+                    let va = vpn << PAGE_SIZE_BITS;
+                    let old_pa = pte2.ppn() << PAGE_SIZE_BITS;
+
+                    let new_pa = alloc_page()?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            old_pa as *const u8,
+                            new_pa as *mut u8,
+                            PAGE_SIZE,
+                        );
+                    }
+                    new_pt.map(va, new_pa, flags);
+                }
+            }
+        }
+        Some(new_pt)
+    }
 }
 
 pub static KERNEL_PAGE_TABLE: Mutex<Option<PageTable>> = Mutex::new(None);
@@ -266,6 +319,7 @@ pub fn init_kernel_page_table() {
     for addr in (0x0c00_0000..0x0c20_0000).step_by(PAGE_SIZE) {
         pt.map(addr, addr, PTEFlags::R | PTEFlags::W);
     }
+    pt.map(0x100000, 0x100000, PTEFlags::R | PTEFlags::W);
 
     let satp = (8usize << 60) | pt.root_ppn();
     *KERNEL_PAGE_TABLE.lock() = Some(pt);

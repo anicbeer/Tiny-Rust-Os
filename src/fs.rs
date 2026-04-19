@@ -1,5 +1,5 @@
 use spin::Mutex;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
 
@@ -33,12 +33,13 @@ impl File {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OpenFile {
     pub inode: usize,
     pub offset: usize,
     pub readable: bool,
     pub writable: bool,
+    pub pipe_id: Option<usize>,
 }
 
 static FS: Mutex<BTreeMap<String, File>> = Mutex::new(BTreeMap::new());
@@ -46,6 +47,7 @@ static NEXT_INODE: Mutex<usize> = Mutex::new(1);
 static INODE_MAP: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
 
 pub fn init() {
+    mkdir("/");
     mkdir("/etc");
     mkdir("/etc/nginx");
     mkdir("/var");
@@ -80,6 +82,18 @@ pub fn init() {
 
     let test_bin = include_bytes!("/tmp/test_malloc2");
     create_file_static("/test_malloc", test_bin);
+
+    // Busybox shell and applets (share one static binary reference)
+    let busybox = include_bytes!("/tmp/busybox-1.36.1/busybox");
+    mkdir("/bin");
+    create_file_static("/bin/busybox", busybox);
+    create_file_static("/bin/sh", busybox);
+    create_file_static("/bin/ls", busybox);
+    create_file_static("/bin/cat", busybox);
+    create_file_static("/bin/echo", busybox);
+    create_file_static("/bin/pwd", busybox);
+    create_file_static("/bin/mkdir", busybox);
+    create_file_static("/bin/ps", busybox);
 
     let config = br#"
 daemon off;
@@ -121,7 +135,7 @@ http {
 
     let local_config = br#"
 daemon off;
-master_process off;
+user root root;
 worker_processes 1;
 error_log /usr/local/nginx/logs/error.log;
 pid /usr/local/nginx/logs/nginx.pid;
@@ -257,4 +271,101 @@ pub fn get_file_data(path: &str) -> Option<&'static [u8]> {
         FileContents::Static(s) => Some(s),
         FileContents::Dynamic(_) => None,
     })
+}
+
+pub fn read_dir(inode: usize, buf: &mut [u8], offset: usize) -> (usize, usize) {
+    let inode_map = INODE_MAP.lock();
+    let dir_path = match inode_map.get(&inode) {
+        Some(p) => p.clone(),
+        None => return (0, offset),
+    };
+    drop(inode_map);
+
+    let fs = FS.lock();
+    if let Some(f) = fs.get(&dir_path) {
+        if f.len() != 0 {
+            return (0, offset); // not a directory
+        }
+    } else {
+        return (0, offset);
+    }
+
+    let prefix = if dir_path == "/" {
+        String::from("/")
+    } else {
+        let mut s = dir_path.clone();
+        s.push('/');
+        s
+    };
+
+    let mut entries: alloc::vec::Vec<(alloc::string::String, u64, u8)> = alloc::vec::Vec::new();
+
+    // Add . and ..
+    entries.push((String::from("."), inode as u64, 4)); // DT_DIR
+    entries.push((String::from(".."), inode as u64, 4)); // DT_DIR
+
+    let mut seen = BTreeSet::new();
+    seen.insert(String::from("."));
+    seen.insert(String::from(".."));
+
+    for (path_str, file) in fs.iter() {
+        if !path_str.starts_with(&prefix) {
+            continue;
+        }
+        let remainder = &path_str[prefix.len()..];
+        if remainder.is_empty() {
+            continue;
+        }
+        let name = if let Some(pos) = remainder.find('/') {
+            &remainder[..pos]
+        } else {
+            remainder
+        };
+        if seen.contains(name) {
+            continue;
+        }
+        seen.insert(name.to_string());
+
+        // Determine inode for this entry
+        let entry_inode = {
+            let im = INODE_MAP.lock();
+            im.iter().find(|(_, p)| *p == path_str).map(|(i, _)| *i as u64).unwrap_or(0)
+        };
+
+        let d_type = if file.len() == 0 { 4u8 } else { 8u8 }; // DT_DIR=4, DT_REG=8
+        entries.push((name.to_string(), entry_inode, d_type));
+    }
+
+    drop(fs);
+
+    if offset >= entries.len() {
+        return (0, offset);
+    }
+
+    let mut entries_written = 0usize;
+    let mut buf_off = 0usize;
+    for (idx, (name, entry_inode, d_type)) in entries.iter().enumerate().skip(offset) {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len() + 1; // +1 for null
+        let reclen = (19 + name_len + 7) & !7; // 8+8+2+1 = 19 header, align to 8
+        if buf_off + reclen > buf.len() {
+            break;
+        }
+
+        let base = &mut buf[buf_off..];
+        base[..8].copy_from_slice(&entry_inode.to_ne_bytes());
+        base[8..16].copy_from_slice(&(idx as i64 + 1).to_ne_bytes()); // d_off = next index
+        base[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        base[18] = *d_type;
+        base[19..19 + name_bytes.len()].copy_from_slice(name_bytes);
+        base[19 + name_bytes.len()] = 0;
+        for i in (19 + name_len)..reclen {
+            base[i] = 0;
+        }
+
+        buf_off += reclen;
+        entries_written += 1;
+    }
+
+    (buf_off, offset + entries_written)
 }

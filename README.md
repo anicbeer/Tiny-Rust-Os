@@ -1,14 +1,16 @@
 # RVOS — RISC-V Operating System in Rust
 
-A minimal RISC-V 64-bit OS kernel written in Rust (`#![no_std]`), capable of running an unmodified statically-linked Linux nginx binary under QEMU with virtio-net networking.
+A minimal RISC-V 64-bit OS kernel written in Rust (`#![no_std]`), capable of running an unmodified statically-linked Linux busybox shell and nginx binary under QEMU with virtio-net networking.
 
 ## Features
 
 - **RISC-V 64** (`rv64gc`) bare-metal kernel, SV39 virtual memory
 - **VirtIO-MMIO** virtio-net device driver
 - **smoltcp 0.11** TCP/IP stack with full socket syscall emulation (`socket`, `bind`, `listen`, `accept`, `sendto`, `recvfrom`)
-- **Linux syscall compatibility layer** — emulates ~45 syscalls so unmodified glibc static binaries can run without recompilation
-- **In-memory RAMFS** with static and dynamic file support
+- **Linux syscall compatibility layer** — emulates ~50 syscalls so unmodified glibc static binaries can run without recompilation
+- **Multi-process support** — `clone`/`fork`, `execve`, `wait4`, `exit`, and round-robin cooperative scheduling
+- **Shell & pipes** — busybox `sh` with `fork`+`execve` and `pipe2` (`cmd1 | cmd2`)
+- **In-memory RAMFS** with static and dynamic file support and `getdents64` directory listing
 - **ELF loading** with full `PT_LOAD` segment mapping, auxv initialization, and per-process `brk`
 - **User/kernel mode switching** via S-mode trap handler with complete register save/restore
 
@@ -16,7 +18,7 @@ A minimal RISC-V 64-bit OS kernel written in Rust (`#![no_std]`), capable of run
 
 ```
 +-------------------------------------------+
-|  User Space: nginx (static glibc binary)  |
+|  User Space: busybox sh, nginx, cat, ls   |
 +-------------------------------------------+
 |  Linux Syscall Emulation (src/syscall.rs) |
 +-------------------------------------------+
@@ -39,7 +41,7 @@ A minimal RISC-V 64-bit OS kernel written in Rust (`#![no_std]`), capable of run
 |------|----------------|
 | `entry.asm` | Boot entry: BSS zeroing, stack setup, call `rust_main` |
 | `linker.ld` | Kernel linked at `0x8020_0000` |
-| `main.rs` | Init sequence: console → mm → heap → page table → trap → virtio → net → fs → proc → run nginx |
+| `main.rs` | Init sequence: console → mm → heap → page table → trap → virtio → net → fs → proc → run busybox shell |
 | `console.rs` | Early UART output via SBI |
 | `mm.rs` | Bump heap allocator, page frame allocator, SV39 `PageTable` with `map`/`translate` |
 | `trap.rs` | Naked trap vector in assembly: swap to kernel stack, save all registers, set `sstatus.SUM`, call `rust_trap_handler`, restore and `sret` |
@@ -47,7 +49,7 @@ A minimal RISC-V 64-bit OS kernel written in Rust (`#![no_std]`), capable of run
 | `net.rs` | `smoltcp` `Device` impl bridging virtio-net RX/TX; socket fd management, TCP listen/accept/send/recv |
 | `fs.rs` | In-memory BTreeMap-based filesystem; `FileContents::Static` for embedded blobs, `FileContents::Dynamic` for writable logs |
 | `proc.rs` | `Process` struct with SV39 page table, `TrapFrame`, kernel stack, per-process `brk`; ELF loader with auxv setup |
-| `syscall.rs` | Syscall dispatcher for ~45 Linux syscalls; fd tables, fake fds for epoll/eventfd/NSCD, socket emulation |
+| `syscall.rs` | Syscall dispatcher for ~50 Linux syscalls; fd tables, pipes, fake fds for epoll/eventfd/NSCD, socket emulation |
 
 ## Build
 
@@ -60,6 +62,8 @@ cargo build --release
 
 ## Run
 
+Default boot launches a busybox shell (`sh -c "echo '=== RVOS Shell ==='; ls /; cat /etc/passwd; echo '=== Done ==='"`):
+
 ```bash
 qemu-system-riscv64 \
   -machine virt -m 512M -nographic \
@@ -68,6 +72,17 @@ qemu-system-riscv64 \
   -device virtio-net-device,netdev=net0
 ```
 
+Expected output:
+
+```
+=== RVOS Shell ===
+bin   lib   sbin  test_malloc  usr
+etc   proc  sys   tmp          var
+root:x:0:0:root:/root:/bin/sh
+=== Done ===
+```
+
+To run nginx instead, edit `src/main.rs` and change `init_user_proc` to load `/sbin/nginx`.
 Then test from host:
 
 ```bash
@@ -90,15 +105,17 @@ curl http://127.0.0.1:18080/
 | 54 | `fchownat` | ✅ | Stub (returns 0) |
 | 56 | `openat` | ✅ | |
 | 57 | `close` | ✅ | |
-| 61 | `getdents64` | ❌ | Returns -1 (no directory listing) |
+| 59 | `pipe2` | ✅ | Ring-buffer pipe; `fork` shares pipe fd |
+| 61 | `getdents64` | ✅ | RAMFS directory listing with `.` / `..` |
 | 62 | `lseek` | ✅ | |
-| 63–64 | `read/write` | ✅ | Files + sockets + NSCD |
+| 63–64 | `read/write` | ✅ | Files + pipes + sockets + NSCD |
 | 66 | `writev` | ✅ | Scatter-gather write |
 | 67–68 | `pread64/pwrite64` | ✅ | |
+| 71 | `sendfile` | ✅ | Read/write fallback |
 | 73 | `ppoll` | ✅ | Fake fds only |
 | 78 | `readlinkat` | ✅ | `/proc/self/exe` → `/sbin/nginx` |
 | 79–80 | `fstatat/fstat` | ✅ | Minimal 128-byte stat |
-| 93–94 | `exit/exit_group` | ✅ | Spins forever |
+| 93–94 | `exit/exit_group` | ✅ | Marks Zombie for `wait4` |
 | 96 | `set_tid_address` | ✅ | Stub |
 | 99 | `set_robust_list` | ✅ | Stub |
 | 113 | `clock_gettime` | ✅ | `rdtime` at 10 MHz |
@@ -108,16 +125,17 @@ curl http://127.0.0.1:18080/
 | 163 | `getrlimit` | ✅ | `NOFILE=1024` |
 | 166 | `umask` | ✅ | Returns `022` |
 | 167 | `prctl` | ✅ | Stub |
-| 172–177 | `getpid/ppid/uid/euid/gid/egid` | ✅ | Fixed values |
+| 172–177 | `getpid/ppid/uid/euid/gid/egid` | ✅ | Real pid via `CURRENT_PID` |
 | 198–210 | Socket family | ✅ | `socket/bind/listen/accept/accept4/connect/getsockname/getpeername/sendto/recvfrom/setsockopt/getsockopt/shutdown` |
 | 212 | `recvmsg` | ✅ | NSCD only |
 | 214 | `brk` | ✅ | Per-process, page-aligned, contiguous with ELF |
 | 215 | `munmap` | ⚠️ | Stub (returns 0) |
-| 220 | `clone` | ❌ | Returns -1 (no multi-process) |
+| 220 | `clone` | ✅ | Fork with shared fd table / page-table clone |
+| 221 | `execve` | ✅ | Replaces address space, preserves pid/fds |
 | 222 | `mmap` | ✅ | Anonymous + file-backed, `MAP_FIXED` |
 | 226 | `mprotect` | ⚠️ | Stub |
 | 233 | `madvise` | ⚠️ | Stub |
-| 260 | `wait4` | ❌ | Returns -1 |
+| 260 | `wait4` | ✅ | Non-blocking / blocking zombie collection |
 | 261 | `prlimit64` | ✅ | `NOFILE` only |
 | 278 | `getrandom` | ✅ | Returns `0xAB` pattern |
 | 291 | `statx` | ✅ | |
@@ -138,6 +156,7 @@ ARP, ICMP ping, and TCP (HTTP) are all functional. The network stack uses a busy
 At boot, `fs::init()` creates a minimal Linux-like filesystem tree:
 
 ```
+/bin/busybox, /bin/sh, /bin/ls, /bin/cat, /bin/echo, /bin/pwd, /bin/mkdir, /bin/ps
 /sbin/nginx                    — nginx binary (embedded at compile time)
 /etc/nginx/nginx.conf          — nginx config
 /usr/local/nginx/conf/nginx.conf
@@ -178,14 +197,12 @@ All files live in a `BTreeMap<String, File>` guarded by a `spin::Mutex`. Static 
 
 ## Known Limitations
 
-1. **Single process only** — `clone` and `wait4` are stubs. nginx runs with `master_process off; worker_processes 1;`.
-2. **No preemptive scheduling** — The kernel is cooperative; user process runs until it traps (syscall or exception).
-3. **No timer interrupts** — `clock_gettime` uses `rdtime`; there is no tick-based scheduler.
-4. **No block device** — Although VirtIO block init exists, there is no persistent storage. All data is in RAMFS.
-5. **Bump heap only** — No `free` for kernel heap allocations; page frames are also never freed.
-6. **No signal delivery** — `rt_sigaction`/`rt_sigprocmask` are stubs.
-7. **No directory listing** — `getdents64` returns -1.
-8. **getrandom is not random** — Returns a fixed `0xAB` pattern.
+1. **Cooperative scheduling only** — Round-robin on syscall traps; no timer interrupts or preemption.
+2. **No block device** — Although VirtIO block init exists, there is no persistent storage. All data is in RAMFS.
+3. **Bump heap only** — No `free` for kernel heap allocations; page frames are also never freed.
+4. **No signal delivery** — `rt_sigaction`/`rt_sigprocmask` are stubs.
+5. **No TTY / interactive input** — `stdin` is a null device; shell is non-interactive (`sh -c "..."`).
+6. **getrandom is not random** — Returns a fixed `0xAB` pattern.
 
 ## Debug Tips
 

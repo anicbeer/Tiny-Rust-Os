@@ -1,5 +1,4 @@
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -166,7 +165,7 @@ pub fn init() {
         }
     }
     // Poll for ARP response via smoltcp so it populates ARP cache
-    for i in 0..500 {
+    for _ in 0..500 {
         poll_network();
         for _ in 0..5000 { core::hint::spin_loop(); }
     }
@@ -205,7 +204,7 @@ pub fn set_epoll_data(fd: usize, data: u64) {
 
 pub fn poll_network() {
     {
-        let mut net = crate::virtio::NET_DEVICE.lock();
+        let net = crate::virtio::NET_DEVICE.lock();
         if net.is_none() {
             return;
         }
