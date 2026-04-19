@@ -28,7 +28,7 @@ extern "C" fn rust_main(hartid: usize, dtb: usize) -> ! {
     // Very early UART init so we can print
     console::init();
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Info);
 
     info!("RVOS booting on hart {}", hartid);
     info!("Kernel: [{:#x}, {:#x})", kernel_start as usize, kernel_end as usize);
@@ -44,9 +44,14 @@ extern "C" fn rust_main(hartid: usize, dtb: usize) -> ! {
 
     info!("Kernel init complete.");
 
-    // Load and run busybox shell
+    // Load and run busybox shell (interactive)
     let sh_data = fs::get_file_data("/bin/sh").expect("sh binary not found");
-    proc::init_user_proc(sh_data, &["sh", "-c", "echo '=== RVOS Shell ==='; ls /; cat /etc/passwd; echo '=== Done ==='"]).expect("failed to load shell");
+    proc::init_user_proc(sh_data, &["sh"]).expect("failed to load shell");
+
+    // To run nginx instead, replace the above two lines with:
+    // let nginx_data = fs::get_file_data("/bin/nginx").expect("nginx binary not found");
+    // proc::init_user_proc(nginx_data, &["nginx"]).expect("failed to load nginx");
+
     proc::run_user();
 }
 

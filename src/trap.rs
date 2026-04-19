@@ -185,11 +185,20 @@ extern "C" fn rust_trap_handler(tf: &mut TrapFrameRaw) {
                 log::debug!("SYSCALL {} args={:x?} sepc={:#x}", num, args, sepc);
             }
             let is_execve = num == 221;
+            let is_wait4 = num == 260;
             if !is_execve {
                 tf.sepc += 4; // advance past ecall instruction
             }
             let ret = crate::syscall::dispatch(num, args);
-            if is_execve && ret == 0 {
+            if is_wait4 && ret == -11 {
+                // Blocking wait4: roll back sepc so it re-executes on wake-up
+                tf.sepc -= 4;
+                let pid = *crate::proc::CURRENT_PID.lock();
+                let mut table = crate::proc::PROC_TABLE.lock();
+                if let Some(proc) = table.get_mut(&pid) {
+                    proc.state = crate::proc::ProcState::Waiting;
+                }
+            } else if is_execve && ret == 0 {
                 // execve succeeded: sync updated trap frame back to stack
                 let ctf = CURRENT_TRAP_FRAME.lock();
                 log::info!("EXECVE sync: old_sepc={:#x} new_sepc={:#x}", tf.sepc, ctf.sepc);

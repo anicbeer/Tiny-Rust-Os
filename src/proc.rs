@@ -10,6 +10,7 @@ use crate::syscall::FdTable;
 pub enum ProcState {
     Ready,
     Running,
+    Waiting,
     Zombie,
 }
 
@@ -329,10 +330,16 @@ pub fn fork_process(parent_tf: &TrapFrame) -> Option<usize> {
 pub fn exit_process(code: isize) {
     let pid = *CURRENT_PID.lock();
     let mut table = PROC_TABLE.lock();
+    let ppid = table.get(&pid).map(|p| p.ppid).unwrap_or(0);
     if let Some(proc) = table.get_mut(&pid) {
         proc.state = ProcState::Zombie;
         proc.exit_code = code;
         log::info!("Process {} exited with code {}", pid, code);
+    }
+    if let Some(parent) = table.get_mut(&ppid) {
+        if parent.state == ProcState::Waiting {
+            parent.state = ProcState::Ready;
+        }
     }
 }
 

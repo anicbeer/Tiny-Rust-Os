@@ -244,6 +244,29 @@ fn sys_write(fd: isize, buf: *const u8, count: usize) -> isize {
 }
 
 fn sys_read(fd: isize, buf: *mut u8, count: usize) -> isize {
+    // Check fd_table first: if fd 0 was closed and reused for a file, read the file
+    {
+        let mut fd_table = FD_TABLE.lock();
+        if let Some(of) = fd_table.get(fd as usize) {
+            if of.inode == 0 && of.pipe_id.is_none() {
+                // stdin: read from UART, blocking until newline or full buffer
+                drop(fd_table);
+                let mut n = 0;
+                while n < count {
+                    if let Some(c) = console::getchar() {
+                        unsafe { *buf.add(n) = c; }
+                        n += 1;
+                        if c == b'\n' || c == b'\r' {
+                            break;
+                        }
+                    } else {
+                        core::hint::spin_loop();
+                    }
+                }
+                return n as isize;
+            }
+        }
+    }
     if let Some(FakeFdType::Nscd(state)) = FAKE_FDS.lock().get_mut(&(fd as usize)) {
         let n = (state.data.len().saturating_sub(state.offset)).min(count);
         if n > 0 {
@@ -314,7 +337,7 @@ fn sys_openat(_dirfd: isize, path: *const u8, flags: isize, _mode: isize) -> isi
         let fd = fd_table.alloc(OpenFile { inode, offset: 0, readable, writable, pipe_id: None });
         return fd as isize;
     }
-    -1
+    -2
 }
 
 fn read_user_u64(addr: usize) -> Option<usize> {
@@ -343,6 +366,11 @@ fn read_user_str(addr: usize) -> Option<alloc::string::String> {
 }
 
 fn sys_close(fd: isize) -> isize {
+    if fd < 3 && fd >= 0 {
+        // Refuse to close stdin/stdout/stderr — many libc routines reopen
+        // files on the first free fd and expect 0/1/2 to stay reserved.
+        return -1;
+    }
     if is_inet_socket(fd as usize) {
         log::info!("sys_close: inet socket fd={}", fd);
         crate::net::close_fd(fd as usize);
@@ -373,6 +401,11 @@ fn sys_lseek(fd: isize, offset: isize, whence: isize) -> isize {
 fn sys_fstat(fd: isize, buf: *mut u8) -> isize {
     let mut fd_table = FD_TABLE.lock();
     if let Some(of) = fd_table.get(fd as usize) {
+        if of.inode == 0 {
+            // stdin/stdout/stderr: character device
+            unsafe { fill_stat_chr(buf); }
+            return 0;
+        }
         let size = fs::file_size(of.inode) as u64;
         unsafe { fill_stat(buf, size); }
         return 0;
@@ -386,7 +419,7 @@ fn sys_fstatat(_dirfd: isize, path: *const u8, buf: *mut u8, _flags: isize) -> i
         unsafe { fill_stat(buf, size); }
         0
     } else {
-        -1
+        -2
     }
 }
 
@@ -579,6 +612,11 @@ fn sys_ioctl(fd: isize, req: isize, _arg: *mut u8) -> isize {
             return 0;
         }
     }
+    if req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404 {
+        // TCGETS / TCSETS / TCSETSW / TCSETSF — fail so isatty() returns false
+        // and the shell treats stdin as a pipe (reads commands until EOF)
+        return -1;
+    }
     0
 }
 fn sys_prctl(_option: isize, _arg2: usize, _arg3: usize, _arg4: usize, _arg5: usize) -> isize { 0 }
@@ -605,7 +643,7 @@ fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: isize) -> isize {
 
 fn sys_faccessat(_dirfd: isize, path: *const u8, _mode: isize, _flags: isize) -> isize {
     let path = unsafe { cstr(path) };
-    if fs::lookup(path).is_some() { 0 } else { -1 }
+    if fs::lookup(path).is_some() { 0 } else { -2 }
 }
 fn sys_mkdirat(_dirfd: isize, path: *const u8, _mode: isize) -> isize {
     let path = unsafe { cstr(path) };
@@ -783,7 +821,7 @@ fn sys_execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -
         Some(d) => d,
         None => {
             log::warn!("sys_execve: file not found: {}", path);
-            return -1;
+            return -2;
         }
     };
 
@@ -1138,6 +1176,18 @@ unsafe fn fill_stat(buf: *mut u8, size: u64) {
     *(buf.add(48) as *mut u64) = size; // st_size
     *(buf.add(56) as *mut u32) = 4096; // st_blksize
     *(buf.add(64) as *mut u64) = (size + 511) / 512; // st_blocks
+}
+
+unsafe fn fill_stat_chr(buf: *mut u8) {
+    core::ptr::write_bytes(buf, 0, 128);
+    *(buf.add(16) as *mut u32) = 0o20620; // st_mode = S_IFCHR | 0620 (crw--w----)
+    *(buf.add(24) as *mut u32) = 1;       // st_nlink
+    *(buf.add(32) as *mut u32) = 0;       // st_uid
+    *(buf.add(36) as *mut u32) = 0;       // st_gid
+    *(buf.add(40) as *mut u64) = 0x102;   // st_rdev = major:minor (1:2 for /dev/null-like)
+    *(buf.add(48) as *mut u64) = 0;       // st_size
+    *(buf.add(56) as *mut u32) = 4096;    // st_blksize
+    *(buf.add(64) as *mut u64) = 0;       // st_blocks
 }
 
 use crate::console;
