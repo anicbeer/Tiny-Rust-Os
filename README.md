@@ -71,6 +71,7 @@ qemu-system-riscv64 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \
   -device virtio-net-device,netdev=net0
 ```
+<img width="1913" height="933" alt="image" src="https://github.com/user-attachments/assets/c17de002-99a7-4ae1-9aaf-55e1a3cfd4a0" />
 
 Expected output:
 
@@ -89,6 +90,8 @@ Then test from host:
 curl http://127.0.0.1:18080/
 # Expected: <html><body><h1>Hello from RVOS nginx!</h1></body></html>
 ```
+<img width="1909" height="957" alt="image" src="https://github.com/user-attachments/assets/6a4a88fd-1ffd-4cf0-86b1-44fcd28f7f6b" />
+
 
 ## Syscalls Implemented
 
