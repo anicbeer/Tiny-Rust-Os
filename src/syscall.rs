@@ -148,10 +148,15 @@ pub fn dispatch(num: usize, args: [usize; 6]) -> isize {
         113 => sys_clock_gettime(args[0] as isize, args[1] as *mut u8),
         122 => sys_sched_setaffinity(args[0] as isize, args[1], args[2] as *const u8),
         123 => sys_sched_getaffinity(args[0] as isize, args[1], args[2] as *mut u8),
+        131 => sys_sigaction(args[0] as isize, args[1] as *const u8, args[2] as *mut u8),
         134 => sys_rt_sigaction(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
         135 => sys_rt_sigprocmask(args[0] as isize, args[1] as *const u8, args[2] as *mut u8, args[3]),
+        178 => sys_gettid(),
         144 => sys_setgid(args[0] as isize),
         146 => sys_setuid(args[0] as isize),
+        154 => sys_setpgid(args[0] as isize, args[1] as isize),
+        155 => sys_getpgrp(),
+        157 => sys_setsid(),
         159 => sys_setgroups(args[0] as isize, args[1] as *const u8),
         160 => sys_uname(args[0] as *mut u8),
         163 => sys_getrlimit(args[0] as isize, args[1] as *mut u8),
@@ -249,14 +254,36 @@ fn sys_read(fd: isize, buf: *mut u8, count: usize) -> isize {
         let mut fd_table = FD_TABLE.lock();
         if let Some(of) = fd_table.get(fd as usize) {
             if of.inode == 0 && of.pipe_id.is_none() {
-                // stdin: read from UART, blocking until newline or full buffer
+                // stdin: read from UART with echo and basic line editing
                 drop(fd_table);
                 let mut n = 0;
                 while n < count {
-                    if let Some(c) = console::getchar() {
+                    if let Some(mut c) = console::getchar() {
+                        // Handle backspace / delete
+                        if c == 0x08 || c == 0x7f {
+                            if n > 0 {
+                                n -= 1;
+                                // Erase on screen: backspace, space, backspace
+                                let erase = b"\x08 \x08";
+                                for &e in erase.iter() {
+                                    crate::console::print(core::format_args!("{}", e as char));
+                                }
+                            }
+                            continue;
+                        }
+                        // Echo printable chars and CR/LF
+                        if c == b'\r' || c == b'\n' {
+                            // Convert CR to LF in buffer, print CR+LF for terminal
+                            c = b'\n';
+                            crate::console::print(core::format_args!("\r\n"));
+                        } else if c >= 0x20 && c < 0x7f {
+                            crate::console::print(core::format_args!("{}", c as char));
+                        } else if c == b'\t' {
+                            crate::console::print(core::format_args!("\t"));
+                        }
                         unsafe { *buf.add(n) = c; }
                         n += 1;
-                        if c == b'\n' || c == b'\r' {
+                        if c == b'\n' {
                             break;
                         }
                     } else {
@@ -519,6 +546,10 @@ fn sys_getppid() -> isize {
 fn sys_setgid(_gid: isize) -> isize { 0 }
 fn sys_setuid(_uid: isize) -> isize { 0 }
 fn sys_setgroups(_size: isize, _list: *const u8) -> isize { 0 }
+fn sys_setpgid(_pid: isize, _pgid: isize) -> isize { 0 }
+fn sys_getpgrp() -> isize { *crate::proc::CURRENT_PID.lock() as isize }
+fn sys_getsid(_pid: isize) -> isize { *crate::proc::CURRENT_PID.lock() as isize }
+fn sys_setsid() -> isize { *crate::proc::CURRENT_PID.lock() as isize }
 fn sys_getuid() -> isize { 0 }
 fn sys_geteuid() -> isize { 0 }
 fn sys_getgid() -> isize { 0 }
@@ -580,6 +611,8 @@ fn sys_clock_gettime(_clk_id: isize, buf: *mut u8) -> isize {
 
 fn sys_rt_sigaction(_sig: isize, _act: *const u8, _oldact: *mut u8, _sigsetsize: usize) -> isize { 0 }
 fn sys_rt_sigprocmask(_how: isize, _set: *const u8, _oldset: *mut u8, _sigsetsize: usize) -> isize { 0 }
+fn sys_sigaction(_sig: isize, _act: *const u8, _oldact: *mut u8) -> isize { 0 }
+fn sys_gettid() -> isize { *crate::proc::CURRENT_PID.lock() as isize }
 fn sys_fcntl(fd: isize, cmd: isize, _arg: usize) -> isize {
     match cmd {
         1 => fd as isize, // F_GETFD
@@ -606,16 +639,34 @@ fn sys_dup2(oldfd: isize, newfd: isize) -> isize {
 fn sys_dup3(oldfd: isize, newfd: isize, _flags: isize) -> isize {
     sys_dup2(oldfd, newfd)
 }
-fn sys_ioctl(fd: isize, req: isize, _arg: *mut u8) -> isize {
+fn sys_ioctl(fd: isize, req: isize, arg: *mut u8) -> isize {
     if req == 0x5421 { // FIONBIO
         if is_fake_fd(fd as usize) || crate::net::is_socket_fd(fd as usize) {
             return 0;
         }
     }
-    if req == 0x5401 || req == 0x5402 || req == 0x5403 || req == 0x5404 {
-        // TCGETS / TCSETS / TCSETSW / TCSETSF — fail so isatty() returns false
-        // and the shell treats stdin as a pipe (reads commands until EOF)
-        return -1;
+    if req == 0x5401 { // TCGETS
+        if fd < 3 {
+            unsafe {
+                // Only set c_lflag = ICANON | ISIG (offset 12)
+                // No ECHO — we do echo in sys_read so the shell doesn't double-echo
+                *(arg.add(12) as *mut u32) = 0x3;
+            }
+            return 0;
+        }
+    }
+    if req == 0x5402 || req == 0x5403 || req == 0x5404 {
+        // TCSETS / TCSETSW / TCSETSF — pretend success
+        return 0;
+    }
+    if req == 0x5413 { // TIOCGWINSZ
+        unsafe {
+            core::ptr::write_bytes(arg, 0, 8);
+            // ws_row = 24, ws_col = 80 (standard terminal size)
+            *(arg as *mut u16) = 24;
+            *(arg.add(2) as *mut u16) = 80;
+        }
+        return 0;
     }
     0
 }
@@ -961,7 +1012,14 @@ fn sys_ppoll(fds: *mut u8, nfds: usize, _tmo: *mut u8, _sigmask: *mut u8, _sigse
             let fd = *(p as *mut i32);
             let events = *(p.add(4) as *mut i16);
             let revents = p.add(6) as *mut i16;
-            if is_fake_fd(fd as usize) {
+            let is_ready = if fd < 3 {
+                true // stdin/stdout/stderr always ready
+            } else if is_inet_socket(fd as usize) {
+                true
+            } else {
+                is_fake_fd(fd as usize)
+            };
+            if is_ready {
                 *revents = events & 0x005; // POLLIN | POLLOUT
                 ready += 1;
             } else {

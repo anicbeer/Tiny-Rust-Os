@@ -28,7 +28,7 @@ extern "C" fn rust_main(hartid: usize, dtb: usize) -> ! {
     // Very early UART init so we can print
     console::init();
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Warn);
 
     info!("RVOS booting on hart {}", hartid);
     info!("Kernel: [{:#x}, {:#x})", kernel_start as usize, kernel_end as usize);
